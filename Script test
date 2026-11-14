@@ -1,3 +1,8 @@
+local DeltaXUI = getgenv and getgenv().DeltaXUI
+if not DeltaXUI then
+    warn("[DeltaX_Modules] Base UI not found. Load DeltaX_UI first.")
+    return
+end
 --═══════════════════════════════════════════════════════════════════════
 --  DELTA X — COMPLETE MODULE PACK v2.0
 --  Procedural Assets | No Image Files Required | 4000+ Lines
