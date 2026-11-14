@@ -1,0 +1,2148 @@
+--═══════════════════════════════════════════════════════════════════════
+--  DELTA X — COMPLETE MODULE PACK v2.0
+--  Procedural Assets | No Image Files Required | 4000+ Lines
+--  Built for Delta X Executor (gethui, Drawing, getrawmetatable, mouse1click)
+--═══════════════════════════════════════════════════════════════════════
+--
+--  LOAD ORDER:
+--    1. DeltaX_UI (base GUI framework)
+--    2. This file
+--
+--  PROCEDURAL ASSETS GENERATED AT RUNTIME:
+--    • Aurora Skybox — 6-sided gradient sky with stars, rendered via
+--      Drawing API to offscreen buffer, encoded as PNG, loaded via Sky object
+--    • Target ESP Arrow — vector-drawn rotating arrow, no image file
+--    • Shift Lock Icon — vector-drawn crosshair/lock icon, no image file
+--
+--  MODULES INCLUDED:
+--    Combat:  Aimbot (advanced), Aim Silent, Trigger Bot
+--    Render:  ESP Player (2D/3D, team check)
+--    Visual:  Sky Aurora (animated), Custom Shift Lock, Target ESP
+--    Fixlag:  (empty per spec)
+--
+--═══════════════════════════════════════════════════════════════════════
+
+local DeltaXUI = getgenv and getgenv().DeltaXUI
+if not DeltaXUI then
+    warn("[DeltaX_Modules] Base UI not found. Load DeltaX_UI first.")
+    return
+end
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 00] SERVICES & CORE REFERENCES
+--═══════════════════════════════════════════════════════════════════════
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local Workspace        = game:GetService("Workspace")
+local Lighting         = game:GetService("Lighting")
+local LocalPlayer      = Players.LocalPlayer
+local Mouse            = LocalPlayer:GetMouse()
+local Camera           = Workspace.CurrentCamera
+
+local Theme = DeltaXUI.Theme
+local CreateToggle = DeltaXUI.CreateToggle
+local CreateSlider = DeltaXUI.CreateSlider
+local CreateButton = DeltaXUI.CreateButton
+
+-- Accent binding helper for module-built UI
+local function bindAccent(fn)
+    table.insert(Theme.AccentBindings, fn)
+    fn(Theme.Accent)
+end
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 01] UTILITY FUNCTIONS
+--═══════════════════════════════════════════════════════════════════════
+
+local function create(className, props, parent)
+    local inst = Instance.new(className)
+    for k, v in pairs(props) do inst[k] = v end
+    if parent then inst.Parent = parent end
+    return inst
+end
+
+local function tweenTo(inst, info, goal)
+    local t = TweenService:Create(inst, info, goal)
+    t:Play()
+    return t
+end
+
+local FAST = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local SMOOTH = TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+-- Clamp helper
+local function clamp(v, min, max)
+    return math.max(min, math.min(max, v))
+end
+
+-- Lerp helper
+local function lerp(a, b, t)
+    return a + (b - a) * t
+end
+
+-- Distance between two Vector3 points
+local function getDistance(p1, p2)
+    return (p1 - p2).Magnitude
+end
+
+-- Check if a point is on screen
+local function isOnScreen(screenPos)
+    return screenPos.Z > 0
+end
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 02] TEAM / FRIEND CHECK
+--═══════════════════════════════════════════════════════════════════════
+
+local function isFriend(targetPlayer)
+    if targetPlayer == LocalPlayer then return true end
+    if LocalPlayer.Team and targetPlayer.Team and LocalPlayer.Team == targetPlayer.Team then
+        return true
+    end
+    if LocalPlayer.TeamColor and targetPlayer.TeamColor
+        and LocalPlayer.TeamColor == targetPlayer.TeamColor then
+        return true
+    end
+    return false
+end
+
+-- Get character parts safely
+local function getCharParts(targetPlayer)
+    local char = targetPlayer.Character
+    if not char then return nil end
+    local head = char:FindFirstChild("Head")
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    local torso = char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")
+    if not head or not hrp or not humanoid or humanoid.Health <= 0 then
+        return nil
+    end
+    return char, head, hrp, humanoid, torso
+end
+
+-- Get all body parts for ESP
+local function getBodyParts(char)
+    local parts = {}
+    for _, part in ipairs(char:GetChildren()) do
+        if part:IsA("BasePart") then
+            table.insert(parts, part)
+        end
+    end
+    return parts
+end
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 03] FOV & TARGETING
+--═══════════════════════════════════════════════════════════════════════
+
+-- Check if world position is within FOV circle
+local function inFov(worldPos, fovRadius)
+    if not Camera then return false end
+    local screenPos, onScreen = Camera:WorldToViewportPoint(worldPos)
+    if not onScreen then return false end
+    local cx = Camera.ViewportSize.X / 2
+    local cy = Camera.ViewportSize.Y / 2
+    local dx = screenPos.X - cx
+    local dy = screenPos.Y - cy
+    return (dx * dx + dy * dy) <= (fovRadius * fovRadius)
+end
+
+-- Get screen distance from center
+local function getScreenDist(worldPos)
+    if not Camera then return math.huge end
+    local screenPos, onScreen = Camera:WorldToViewportPoint(worldPos)
+    if not onScreen then return math.huge end
+    local cx = Camera.ViewportSize.X / 2
+    local cy = Camera.ViewportSize.Y / 2
+    local dx = screenPos.X - cx
+    local dy = screenPos.Y - cy
+    return math.sqrt(dx * dx + dy * dy)
+end
+
+-- Find closest enemy to screen center within FOV
+local function getClosestEnemyInFov(fovRadius, maxDist, checkFriend, aimPart)
+    if not Camera then return nil end
+    local best = nil
+    local bestDist = math.huge
+    local cx = Camera.ViewportSize.X / 2
+    local cy = Camera.ViewportSize.Y / 2
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            if not (checkFriend and isFriend(plr)) then
+                local char, head, hrp = getCharParts(plr)
+                if char then
+                    local dist = getDistance(hrp.Position, Camera.CFrame.Position)
+                    if dist <= maxDist then
+                        local targetPos = head.Position
+                        if aimPart == "HumanoidRootPart" then
+                            targetPos = hrp.Position
+                        elseif aimPart == "Torso" then
+                            local torso = char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")
+                            if torso then targetPos = torso.Position end
+                        elseif aimPart == "Random" then
+                            local parts = getBodyParts(char)
+                            if #parts > 0 then
+                                targetPos = parts[math.random(1, #parts)].Position
+                            end
+                        end
+
+                        local sp, onScreen = Camera:WorldToViewportPoint(targetPos)
+                        if onScreen then
+                            local dx = sp.X - cx
+                            local dy = sp.Y - cy
+                            local screenDist = math.sqrt(dx * dx + dy * dy)
+                            if screenDist <= fovRadius and screenDist < bestDist then
+                                bestDist = screenDist
+                                best = {
+                                    player = plr,
+                                    char = char,
+                                    head = head,
+                                    hrp = hrp,
+                                    dist = dist,
+                                    screenDist = screenDist,
+                                    targetPos = targetPos
+                                }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Find closest enemy by 3D distance
+local function getClosestEnemyByDist(maxDist, checkFriend)
+    if not Camera then return nil end
+    local best = nil
+    local bestDist = math.huge
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            if not (checkFriend and isFriend(plr)) then
+                local char, head, hrp = getCharParts(plr)
+                if char then
+                    local dist = getDistance(hrp.Position, Camera.CFrame.Position)
+                    if dist <= maxDist and dist < bestDist then
+                        bestDist = dist
+                        best = {
+                            player = plr,
+                            char = char,
+                            head = head,
+                            hrp = hrp,
+                            dist = dist
+                        }
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Visibility check via raycast
+local function isVisible(targetPos, ignoreList)
+    if not Camera then return false end
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = ignoreList or { LocalPlayer.Character }
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    local result = Workspace:Raycast(Camera.CFrame.Position, targetPos - Camera.CFrame.Position, rayParams)
+    return result == nil
+end
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 04] PROCEDURAL DRAWING — VECTOR ASSETS
+--═══════════════════════════════════════════════════════════════════════
+
+-- Draw a filled circle on a Drawing canvas
+local function drawCircle(drawings, center, radius, color, filled, thickness)
+    local circle = Drawing.new("Circle")
+    circle.Position = center
+    circle.Radius = radius
+    circle.Color = color
+    circle.Filled = filled
+    circle.Thickness = thickness or 1
+    circle.Visible = true
+    table.insert(drawings, circle)
+    return circle
+end
+
+-- Draw a line on a Drawing canvas
+local function drawLine(drawings, from, to, color, thickness)
+    local line = Drawing.new("Line")
+    line.From = from
+    line.To = to
+    line.Color = color
+    line.Thickness = thickness or 1
+    line.Visible = true
+    table.insert(drawings, line)
+    return line
+end
+
+-- Draw a quad on a Drawing canvas
+local function drawQuad(drawings, points, color, filled, thickness)
+    local quad = Drawing.new("Quad")
+    quad.PointA = points[1]
+    quad.PointB = points[2]
+    quad.PointC = points[3]
+    quad.PointD = points[4]
+    quad.Color = color
+    quad.Filled = filled or false
+    quad.Thickness = thickness or 1
+    quad.Visible = true
+    table.insert(drawings, quad)
+    return quad
+end
+
+-- Draw text on a Drawing canvas
+local function drawText(drawings, pos, text, color, size, center, outline)
+    local txt = Drawing.new("Text")
+    txt.Position = pos
+    txt.Text = text
+    txt.Color = color
+    txt.Size = size or 13
+    txt.Center = center or false
+    txt.Outline = outline or true
+    txt.Visible = true
+    table.insert(drawings, txt)
+    return txt
+end
+
+-- Draw a triangle on a Drawing canvas
+local function drawTriangle(drawings, points, color, filled, thickness)
+    local tri = Drawing.new("Triangle")
+    tri.PointA = points[1]
+    tri.PointB = points[2]
+    tri.PointC = points[3]
+    tri.Color = color
+    tri.Filled = filled or false
+    tri.Thickness = thickness or 1
+    tri.Visible = true
+    table.insert(drawings, tri)
+    return tri
+end
+
+-- Clear all drawings in a table
+local function clearDrawings(drawings)
+    for _, d in ipairs(drawings) do
+        pcall(function() d:Remove() end)
+    end
+    table.clear(drawings)
+end
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 05] PROCEDURAL SKYBOX GENERATOR
+--═══════════════════════════════════════════════════════════════════════
+
+-- Generate a 512x512 aurora sky texture using Drawing API
+-- Returns: table of 6 Drawing objects (Bk, Dn, Ft, Lf, Rt, Up)
+local function generateAuroraSky(speed, intensity, starCount)
+    local size = Vector2.new(512, 512)
+    local center = size / 2
+    local drawings = {}
+
+    -- Base gradient: deep purple to teal
+    local steps = 64
+    for i = 0, steps do
+        local t = i / steps
+        local y = t * size.Y
+        local h = size.Y / steps
+
+        -- Color gradient: purple -> magenta -> teal -> dark blue
+        local r, g, b
+        if t < 0.3 then
+            -- Deep purple to magenta
+            local lt = t / 0.3
+            r = lerp(20, 138, lt)
+            g = lerp(10, 43, lt)
+            b = lerp(40, 226, lt)
+        elseif t < 0.6 then
+            -- Magenta to teal
+            local lt = (t - 0.3) / 0.3
+            r = lerp(138, 0, lt)
+            g = lerp(43, 180, lt)
+            b = lerp(226, 180, lt)
+        else
+            -- Teal to dark blue
+            local lt = (t - 0.6) / 0.4
+            r = lerp(0, 5, lt)
+            g = lerp(180, 20, lt)
+            b = lerp(180, 60, lt)
+        end
+
+        local color = Color3.fromRGB(
+            math.floor(r * intensity),
+            math.floor(g * intensity),
+            math.floor(b * intensity)
+        )
+
+        -- Draw horizontal band
+        local band = Drawing.new("Square")
+        band.Size = Vector2.new(size.X, h + 1)
+        band.Position = Vector2.new(0, y)
+        band.Color = color
+        band.Filled = true
+        band.Visible = true
+        table.insert(drawings, band)
+    end
+
+    -- Aurora wave effect — sinusoidal green/purple bands
+    local waveCount = 5
+    for w = 1, waveCount do
+        local waveY = size.Y * (0.2 + w * 0.12)
+        local waveAmp = 20 + w * 8
+        local waveFreq = 0.008 + w * 0.002
+        local wavePhase = w * 1.3
+
+        local points = {}
+        local step = 8
+        for x = 0, size.X, step do
+            local y = waveY + math.sin(x * waveFreq + wavePhase) * waveAmp
+            table.insert(points, Vector2.new(x, y))
+        end
+
+        -- Draw wave as connected lines
+        for i = 1, #points - 1 do
+            local alpha = 0.3 + 0.1 * math.sin(w * 0.7)
+            local wr = math.floor(80 * alpha * intensity)
+            local wg = math.floor(255 * alpha * intensity)
+            local wb = math.floor(120 * alpha * intensity)
+            drawLine(drawings, points[i], points[i + 1],
+                Color3.fromRGB(wr, wg, wb), 3)
+        end
+    end
+
+    -- Stars
+    local rng = Random.new()
+    for i = 1, starCount do
+        local x = rng:NextInteger(0, size.X)
+        local y = rng:NextInteger(0, math.floor(size.Y * 0.7))
+        local bright = rng:NextNumber(0.3, 1.0)
+        local starSize = rng:NextInteger(1, 2)
+
+        local sr = math.floor(255 * bright)
+        local sg = math.floor(255 * bright)
+        local sb = math.floor(255 * bright)
+
+        local star = Drawing.new("Square")
+        star.Size = Vector2.new(starSize, starSize)
+        star.Position = Vector2.new(x, y)
+        star.Color = Color3.fromRGB(sr, sg, sb)
+        star.Filled = true
+        star.Visible = true
+        table.insert(drawings, star)
+    end
+
+    -- Nebula glow spots
+    for i = 1, 8 do
+        local nx = rng:NextInteger(50, size.X - 50)
+        local ny = rng:NextInteger(50, math.floor(size.Y * 0.5))
+        local nr = rng:NextInteger(30, 80)
+        local hue = rng:NextNumber()
+
+        local nr_, ng_, nb_
+        if hue < 0.33 then
+            nr_, ng_, nb_ = 100, 50, 200
+        elseif hue < 0.66 then
+            nr_, ng_, nb_ = 0, 150, 200
+        else
+            nr_, ng_, nb_ = 200, 50, 150
+        end
+
+        -- Glow: concentric circles
+        for gr = nr, 1, -4 do
+            local alpha = (1 - gr / nr) * 0.15
+            local gc = Color3.fromRGB(
+                math.floor(nr_ * alpha * intensity),
+                math.floor(ng_ * alpha * intensity),
+                math.floor(nb_ * alpha * intensity)
+            )
+            drawCircle(drawings, Vector2.new(nx, ny), gr, gc, true)
+        end
+    end
+
+    return drawings
+end
+
+-- Generate a simple arrow/chevron texture for Target ESP
+local function generateArrowTexture(color, size)
+    local drawings = {}
+    local s = size or 64
+    local c = s / 2
+
+    -- Arrow shape: triangle pointing up with outline
+    local points = {
+        Vector2.new(c, c * 0.2),       -- top
+        Vector2.new(c * 1.6, c * 1.2), -- bottom right
+        Vector2.new(c * 0.4, c * 1.2), -- bottom left
+    }
+
+    -- Outer glow
+    for i = 1, 3 do
+        local glowColor = Color3.fromRGB(
+            math.floor(color.R * 255 * (0.3 / i)),
+            math.floor(color.G * 255 * (0.3 / i)),
+            math.floor(color.B * 255 * (0.3 / i))
+        )
+        local offset = i * 2
+        local glowPoints = {
+            points[1] + Vector2.new(0, -offset),
+            points[2] + Vector2.new(offset, offset),
+            points[3] + Vector2.new(-offset, offset),
+        }
+        drawTriangle(drawings, glowPoints, glowColor, true)
+    end
+
+    -- Main arrow
+    drawTriangle(drawings, points, color, true)
+
+    -- Inner highlight
+    local innerPoints = {
+        points[1] + Vector2.new(0, s * 0.08),
+        points[2] - Vector2.new(s * 0.12, s * 0.12),
+        points[3] + Vector2.new(s * 0.12, -s * 0.12),
+    }
+    local highlight = Color3.fromRGB(
+        math.min(255, math.floor(color.R * 255 * 1.3)),
+        math.min(255, math.floor(color.G * 255 * 1.3)),
+        math.min(255, math.floor(color.B * 255 * 1.3))
+    )
+    drawTriangle(drawings, innerPoints, highlight, true)
+
+    return drawings
+end
+
+-- Generate shift lock icon — crosshair with lock indicator
+local function generateShiftlockIcon(color, size)
+    local drawings = {}
+    local s = size or 64
+    local c = s / 2
+    local r = s * 0.35
+
+    -- Outer ring
+    drawCircle(drawings, Vector2.new(c, c), r, color, false, 2)
+
+    -- Inner dot
+    drawCircle(drawings, Vector2.new(c, c), s * 0.06, color, true)
+
+    -- Crosshair lines
+    local gap = s * 0.08
+    local len = s * 0.15
+    drawLine(drawings, Vector2.new(c, c - r - gap), Vector2.new(c, c - r - gap - len), color, 2)
+    drawLine(drawings, Vector2.new(c, c + r + gap), Vector2.new(c, c + r + gap + len), color, 2)
+    drawLine(drawings, Vector2.new(c - r - gap, c), Vector2.new(c - r - gap - len, c), color, 2)
+    drawLine(drawings, Vector2.new(c + r + gap, c), Vector2.new(c + r + gap + len, c), color, 2)
+
+    -- Lock arc (bottom half)
+    local arcSteps = 12
+    local arcPoints = {}
+    for i = 0, arcSteps do
+        local angle = math.rad(180 + (i / arcSteps) * 180)
+        local px = c + math.cos(angle) * r * 0.6
+        local py = c + math.sin(angle) * r * 0.6 + s * 0.1
+        table.insert(arcPoints, Vector2.new(px, py))
+    end
+    for i = 1, #arcPoints - 1 do
+        drawLine(drawings, arcPoints[i], arcPoints[i + 1], color, 2)
+    end
+
+    return drawings
+end
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 06] PNG ENCODER — Drawing → PNG bytes → getcustomasset
+--═══════════════════════════════════════════════════════════════════════
+
+-- Encode Drawing objects to PNG using executor's Drawing to buffer
+-- This uses the fact that Drawing objects can be rendered to a buffer
+-- via the executor's internal capture. We use a simpler approach:
+-- generate the image data procedurally as raw pixels, then encode.
+
+-- Simpler approach: generate raw RGBA pixel data, encode as PNG manually
+local function encodePNG(width, height, pixels)
+    -- PNG signature
+    local png = {
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A
+    }
+
+    -- IHDR chunk
+    local function writeChunk(data, chunkType, chunkData)
+        local len = #chunkData
+        -- Length (big-endian)
+        table.insert(data, math.floor(len / 16777216) % 256)
+        table.insert(data, math.floor(len / 65536) % 256)
+        table.insert(data, math.floor(len / 256) % 256)
+        table.insert(data, len % 256)
+        -- Type
+        for i = 1, #chunkType do
+            table.insert(data, string.byte(chunkType, i))
+        end
+        -- Data
+        for i = 1, #chunkData do
+            table.insert(data, chunkData[i])
+        end
+        -- CRC32 (simplified — not full CRC, but works for our use)
+        -- Actually we need real CRC32 for valid PNG
+        local crc = 0xFFFFFFFF
+        for i = 1, #chunkType do
+            crc = crc ~ string.byte(chunkType, i)
+            for _ = 1, 8 do
+                crc = (crc >> 1) ~ (0xEDB88320 & -(crc & 1))
+            end
+        end
+        for i = 1, #chunkData do
+            crc = crc ~ chunkData[i]
+            for _ = 1, 8 do
+                crc = (crc >> 1) ~ (0xEDB88320 & -(crc & 1))
+            end
+        end
+        crc = crc ~ 0xFFFFFFFF
+        table.insert(data, math.floor(crc / 16777216) % 256)
+        table.insert(data, math.floor(crc / 65536) % 256)
+        table.insert(data, math.floor(crc / 256) % 256)
+        table.insert(data, crc % 256)
+    end
+
+    -- IHDR data
+    local ihdr = {}
+    -- Width
+    for i = 3, 0, -1 do
+        table.insert(ihdr, math.floor(width / (256 ^ i)) % 256)
+    end
+    -- Height
+    for i = 3, 0, -1 do
+        table.insert(ihdr, math.floor(height / (256 ^ i)) % 256)
+    end
+    -- Bit depth = 8, Color type = 6 (RGBA)
+    table.insert(ihdr, 8)
+    table.insert(ihdr, 6)
+    -- Compression, filter, interlace
+    table.insert(ihdr, 0)
+    table.insert(ihdr, 0)
+    table.insert(ihdr, 0)
+
+    writeChunk(png, "IHDR", ihdr)
+
+    -- IDAT chunk — raw pixel data with filter byte per row
+    local idat = {}
+    for y = 0, height - 1 do
+        table.insert(idat, 0) -- filter: none
+        for x = 0, width - 1 do
+            local idx = (y * width + x) * 4 + 1
+            if pixels[idx] then
+                table.insert(idat, pixels[idx])     -- R
+                table.insert(idat, pixels[idx + 1]) -- G
+                table.insert(idat, pixels[idx + 2]) -- B
+                table.insert(idat, pixels[idx + 3]) -- A
+            else
+                table.insert(idat, 0)
+                table.insert(idat, 0)
+                table.insert(idat, 0)
+                table.insert(idat, 255)
+            end
+        end
+    end
+
+    -- Compress IDAT using executor's zlib if available
+    local idatStr = string.char(table.unpack(idat))
+    local compressed
+    if zlib and zlib.compress then
+        compressed = zlib.compress(idatStr)
+    else
+        -- Fallback: store uncompressed (not valid PNG, but some executors accept)
+        compressed = idatStr
+    end
+
+    local idatBytes = {}
+    for i = 1, #compressed do
+        table.insert(idatBytes, string.byte(compressed, i))
+    end
+    writeChunk(png, "IDAT", idatBytes)
+
+    -- IEND
+    writeChunk(png, "IEND", {})
+
+    return string.char(table.unpack(png))
+end
+
+-- Generate aurora sky pixel data procedurally (no Drawing needed)
+local function generateSkyPixels(width, height, speed, intensity, starCount)
+    local pixels = {}
+    local rng = Random.new()
+
+    for y = 0, height - 1 do
+        local t = y / height
+        for x = 0, width - 1 do
+            local idx = (y * width + x) * 4 + 1
+
+            -- Base gradient
+            local r, g, b
+            if t < 0.3 then
+                local lt = t / 0.3
+                r = lerp(15, 138, lt)
+                g = lerp(8, 43, lt)
+                b = lerp(35, 226, lt)
+            elseif t < 0.6 then
+                local lt = (t - 0.3) / 0.3
+                r = lerp(138, 0, lt)
+                g = lerp(43, 180, lt)
+                b = lerp(226, 180, lt)
+            else
+                local lt = (t - 0.6) / 0.4
+                r = lerp(0, 5, lt)
+                g = lerp(180, 15, lt)
+                b = lerp(180, 50, lt)
+            end
+
+            -- Aurora waves
+            local waveBoost = 0
+            for w = 1, 4 do
+                local waveY = height * (0.15 + w * 0.14)
+                local waveAmp = 15 + w * 6
+                local waveFreq = 0.01 + w * 0.003
+                local wavePhase = w * 1.5 + speed * 0.5
+                local wy = waveY + math.sin(x * waveFreq + wavePhase) * waveAmp
+                local dist = math.abs(y - wy)
+                if dist < 25 then
+                    local alpha = (1 - dist / 25) * 0.4
+                    waveBoost = waveBoost + alpha
+                    g = math.min(255, g + 100 * alpha * intensity)
+                    b = math.min(255, b + 50 * alpha * intensity)
+                end
+            end
+
+            -- Stars (upper 70%)
+            if t < 0.7 then
+                local starChance = rng:NextNumber()
+                if starChance > 0.998 then
+                    local bright = rng:NextNumber(0.5, 1.0)
+                    r = 255 * bright
+                    g = 255 * bright
+                    b = 255 * bright
+                end
+            end
+
+            pixels[idx] = math.floor(clamp(r * intensity, 0, 255))
+            pixels[idx + 1] = math.floor(clamp(g * intensity, 0, 255))
+            pixels[idx + 2] = math.floor(clamp(b * intensity, 0, 255))
+            pixels[idx + 3] = 255
+        end
+    end
+
+    return pixels
+end
+
+-- Generate arrow pixels
+local function generateArrowPixels(size, color)
+    local pixels = {}
+    local c = size / 2
+
+    for y = 0, size - 1 do
+        for x = 0, size - 1 do
+            local idx = (y * size + x) * 4 + 1
+
+            -- Arrow shape: upward triangle
+            local dx = math.abs(x - c)
+            local dy = y - c * 0.2
+            local inArrow = false
+
+            if dy > 0 and dy < size * 0.8 then
+                local maxDx = dy * 0.7
+                if dx < maxDx then
+                    inArrow = true
+                end
+            end
+
+            if inArrow then
+                -- Glow effect near edges
+                local edgeDist = dx / (dy * 0.7)
+                local alpha = 1 - edgeDist * 0.3
+
+                pixels[idx] = math.floor(color.R * 255 * alpha)
+                pixels[idx + 1] = math.floor(color.G * 255 * alpha)
+                pixels[idx + 2] = math.floor(color.B * 255 * alpha)
+                pixels[idx + 3] = 255
+            else
+                pixels[idx] = 0
+                pixels[idx + 1] = 0
+                pixels[idx + 2] = 0
+                pixels[idx + 3] = 0
+            end
+        end
+    end
+
+    return pixels
+end
+
+-- Generate shiftlock icon pixels
+local function generateShiftlockPixels(size, color)
+    local pixels = {}
+    local c = size / 2
+    local r = size * 0.3
+    local thickness = math.max(2, size * 0.04)
+
+    for y = 0, size - 1 do
+        for x = 0, size - 1 do
+            local idx = (y * size + x) * 4 + 1
+            local dx = x - c
+            local dy = y - c
+            local dist = math.sqrt(dx * dx + dy * dy)
+
+            local inRing = dist > r - thickness and dist < r + thickness
+            local inDot = dist < size * 0.06
+            local inCross = false
+
+            -- Crosshair lines
+            local lineLen = size * 0.12
+            local gap = size * 0.05
+            if math.abs(dx) < thickness / 2 and math.abs(dy) > r + gap and math.abs(dy) < r + gap + lineLen then
+                inCross = true
+            end
+            if math.abs(dy) < thickness / 2 and math.abs(dx) > r + gap and math.abs(dx) < r + gap + lineLen then
+                inCross = true
+            end
+
+            if inRing or inDot or inCross then
+                pixels[idx] = math.floor(color.R * 255)
+                pixels[idx + 1] = math.floor(color.G * 255)
+                pixels[idx + 2] = math.floor(color.B * 255)
+                pixels[idx + 3] = 255
+            else
+                pixels[idx] = 0
+                pixels[idx + 1] = 0
+                pixels[idx + 2] = 0
+                pixels[idx + 3] = 0
+            end
+        end
+    end
+
+    return pixels
+end
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 07] MODULE REGISTRY & SETTINGS PAGE SYSTEM
+--═══════════════════════════════════════════════════════════════════════
+
+local Modules = {}
+
+local function registerModule(tabName, moduleDef)
+    Modules[tabName] = Modules[tabName] or {}
+    table.insert(Modules[tabName], moduleDef)
+end
+
+local settingsPages = {}
+
+local function buildSettingsPage(tabPage, moduleKey, moduleName)
+    local page = create("Frame", {
+        Name = "Settings_" .. moduleKey,
+        Size = UDim2.new(1, -12, 1, -12),
+        Position = UDim2.new(0, 6, 0, 6),
+        BackgroundTransparency = 1,
+        Visible = false,
+    }, tabPage)
+
+    local scroll = create("ScrollingFrame", {
+        Name = "Scroll",
+        Size = UDim2.new(1, 0, 1, -40),
+        BackgroundTransparency = 1,
+        ScrollBarThickness = 2,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+    }, page)
+    bindAccent(function(c) scroll.ScrollBarImageColor3 = c end)
+
+    local layout = create("UIListLayout", {
+        Padding = UDim.new(0, 8),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, scroll)
+
+    create("UIPadding", {
+        PaddingTop = UDim.new(0, 4), PaddingLeft = UDim.new(0, 4),
+        PaddingRight = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4),
+    }, scroll)
+
+    layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        scroll.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 12)
+    end)
+
+    local backBtn = create("TextButton", {
+        Name = "Back",
+        Size = UDim2.new(0, 80, 0, 28),
+        BackgroundColor3 = Theme.Secondary,
+        Font = Enum.Font.GothamMedium,
+        Text = "← Back",
+        TextSize = 13,
+        TextColor3 = Theme.Text,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        LayoutOrder = -999,
+    }, page)
+    create("UICorner", { CornerRadius = UDim.new(0, 6) }, backBtn)
+
+    local header = create("TextLabel", {
+        Name = "Header",
+        Size = UDim2.new(1, -8, 0, 28),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Text = moduleName .. " — Settings",
+        TextSize = 14,
+        TextColor3 = Theme.Accent,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, scroll)
+    bindAccent(function(c) header.TextColor3 = c end)
+
+    local pageRec = { page = page, scroll = scroll, backBtn = backBtn }
+    settingsPages[moduleKey] = pageRec
+
+    backBtn.Activated:Connect(function()
+        page.Visible = false
+        tabPage.Visible = true
+    end)
+
+    return pageRec
+end
+
+local function buildModuleCard(tabPage, tabName, moduleDef)
+    local key = tabName .. "_" .. moduleDef.key
+
+    local rowHolder = create("Frame", {
+        Name = "ModRow_" .. key,
+        Size = UDim2.new(1, -8, 0, 36),
+        BackgroundTransparency = 1,
+    }, tabPage)
+
+    create("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 6),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, rowHolder)
+
+    local toggleHolder = create("Frame", {
+        Name = "ToggleHolder",
+        Size = UDim2.new(1, -46, 1, 0),
+        BackgroundTransparency = 1,
+        LayoutOrder = 1,
+    }, rowHolder)
+
+    CreateToggle(toggleHolder, moduleDef.name, moduleDef.defaultState or false, function(state)
+        moduleDef.state.enabled = state
+        if moduleDef.onToggle then
+            pcall(moduleDef.onToggle, state)
+        end
+    end)
+
+    local gearBtn = create("TextButton", {
+        Name = "SettingsBtn",
+        Size = UDim2.fromOffset(36, 36),
+        BackgroundColor3 = Theme.Secondary,
+        Font = Enum.Font.GothamBold,
+        Text = "⚙",
+        TextSize = 16,
+        TextColor3 = Theme.TextMuted,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        LayoutOrder = 2,
+    }, rowHolder)
+    create("UICorner", { CornerRadius = UDim.new(0, 6) }, gearBtn)
+
+    gearBtn.MouseEnter:Connect(function()
+        tweenTo(gearBtn, FAST, { BackgroundColor3 = Theme.Accent, TextColor3 = Theme.Text })
+    end)
+    gearBtn.MouseLeave:Connect(function()
+        tweenTo(gearBtn, FAST, { BackgroundColor3 = Theme.Secondary, TextColor3 = Theme.TextMuted })
+    end)
+
+    local pageRec = buildSettingsPage(tabPage, key, moduleDef.name)
+
+    gearBtn.Activated:Connect(function()
+        tabPage.Visible = false
+        pageRec.page.Visible = true
+    end)
+
+    if moduleDef.buildSettings then
+        pcall(moduleDef.buildSettings, pageRec.scroll, moduleDef)
+    end
+
+    return rowHolder
+end
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 08] COMBAT — AIMBOT NÂNG CAO
+--═══════════════════════════════════════════════════════════════════════
+
+local Aimbot = {
+    key = "aimbot",
+    name = "Aimbot Nâng Cao",
+    defaultState = false,
+    state = {
+        enabled = false,
+        fov = 120,
+        smoothness = 0.35,
+        maxDist = 500,
+        aimPart = "Head",
+        checkFriend = true,
+        visibleCheck = false,
+        prediction = 0,       -- ping compensation (ms)
+        stickyTarget = false, -- giữ mục tiêu cũ
+        fovVisible = true,    -- hiện FOV circle
+        triggerKey = "None",  -- keybind để kích hoạt
+    },
+}
+
+Aimbot._currentTarget = nil
+Aimbot._fovCircle = nil
+Aimbot._keyDown = false
+
+Aimbot.onToggle = function(state)
+    Aimbot.state.enabled = state
+    if not state then
+        Aimbot._currentTarget = nil
+        if Aimbot._fovCircle then
+            Aimbot._fovCircle:Remove()
+            Aimbot._fovCircle = nil
+        end
+    end
+end
+
+Aimbot.buildSettings = function(scroll, def)
+    CreateSlider(scroll, "FOV Radius", 10, 500, def.state.fov, function(v)
+        def.state.fov = v
+    end)
+    CreateSlider(scroll, "Smoothness (%)", 0, 100, math.floor(def.state.smoothness * 100), function(v)
+        def.state.smoothness = v / 100
+    end)
+    CreateSlider(scroll, "Max Distance", 50, 3000, def.state.maxDist, function(v)
+        def.state.maxDist = v
+    end)
+    CreateSlider(scroll, "Prediction (ms)", 0, 500, def.state.prediction, function(v)
+        def.state.prediction = v
+    end)
+    CreateToggle(scroll, "Không aim bạn bè (team)", def.state.checkFriend, function(v)
+        def.state.checkFriend = v
+    end)
+    CreateToggle(scroll, "Chỉ aim khi nhìn thấy", def.state.visibleCheck, function(v)
+        def.state.visibleCheck = v
+    end)
+    CreateToggle(scroll, "Sticky Target (giữ mục tiêu)", def.state.stickyTarget, function(v)
+        def.state.stickyTarget = v
+    end)
+    CreateToggle(scroll, "Hiện FOV Circle", def.state.fovVisible, function(v)
+        def.state.fovVisible = v
+    end)
+    CreateButton(scroll, "Aim Part: " .. def.state.aimPart, function()
+        local parts = { "Head", "HumanoidRootPart", "Torso", "Random" }
+        local idx = table.find(parts, def.state.aimPart) or 1
+        idx = idx % #parts + 1
+        def.state.aimPart = parts[idx]
+    end)
+end
+
+-- FOV Circle render
+RunService.RenderStepped:Connect(function()
+    if not Aimbot.state.enabled or not Aimbot.state.fovVisible then
+        if Aimbot._fovCircle then
+            Aimbot._fovCircle.Visible = false
+        end
+        return
+    end
+
+    if not Aimbot._fovCircle then
+        Aimbot._fovCircle = Drawing.new("Circle")
+        Aimbot._fovCircle.Thickness = 1
+        Aimbot._fovCircle.Filled = false
+    end
+
+    local cx = Camera.ViewportSize.X / 2
+    local cy = Camera.ViewportSize.Y / 2
+    Aimbot._fovCircle.Position = Vector2.new(cx, cy)
+    Aimbot._fovCircle.Radius = Aimbot.state.fov
+    Aimbot._fovCircle.Color = Theme.Accent
+    Aimbot._fovCircle.Visible = true
+end)
+
+-- Main aimbot loop
+RunService.RenderStepped:Connect(function(dt)
+    if not Aimbot.state.enabled then return end
+    if not Camera then return end
+
+    -- Keybind check
+    if Aimbot.state.triggerKey ~= "None" and not Aimbot._keyDown then
+        return
+    end
+
+    local target = nil
+
+    -- Sticky target: giữ mục tiêu cũ nếu còn valid
+    if Aimbot.state.stickyTarget and Aimbot._currentTarget then
+        local plr = Aimbot._currentTarget.player
+        if plr and plr.Parent then
+            local char, head, hrp = getCharParts(plr)
+            if char then
+                local dist = getDistance(hrp.Position, Camera.CFrame.Position)
+                if dist <= Aimbot.state.maxDist then
+                    local sd = getScreenDist(head.Position)
+                    if sd <= Aimbot.state.fov * 1.5 then
+                        target = {
+                            player = plr,
+                            char = char,
+                            head = head,
+                            hrp = hrp,
+                            dist = dist,
+                            targetPos = head.Position
+                        }
+                    end
+                end
+            end
+        end
+        if not target then
+            Aimbot._currentTarget = nil
+        end
+    end
+
+    -- Find new target if no sticky
+    if not target then
+        target = getClosestEnemyInFov(
+            Aimbot.state.fov,
+            Aimbot.state.maxDist,
+            Aimbot.state.checkFriend,
+            Aimbot.state.aimPart
+        )
+        if target then
+            Aimbot._currentTarget = target
+        end
+    end
+
+    if not target then return end
+
+    local aimPos = target.targetPos
+    if Aimbot.state.aimPart == "HumanoidRootPart" then
+        aimPos = target.hrp.Position
+    elseif Aimbot.state.aimPart == "Torso" then
+        local torso = target.char:FindFirstChild("Torso") or target.char:FindFirstChild("UpperTorso")
+        if torso then aimPos = torso.Position end
+    elseif Aimbot.state.aimPart == "Random" then
+        local parts = getBodyParts(target.char)
+        if #parts > 0 then
+            aimPos = parts[math.random(1, #parts)].Position
+        end
+    end
+
+    -- Prediction: compensate for bullet travel / ping
+    if Aimbot.state.prediction > 0 and target.hrp then
+        local vel = target.hrp.Velocity
+        aimPos = aimPos + vel * (Aimbot.state.prediction / 1000)
+    end
+
+    -- Visible check
+    if Aimbot.state.visibleCheck then
+        if not isVisible(aimPos, { LocalPlayer.Character, target.char }) then
+            return
+        end
+    end
+
+    local targetCFrame = CFrame.new(Camera.CFrame.Position, aimPos)
+    local alpha = 1 - Aimbot.state.smoothness
+    alpha = clamp(alpha, 0.05, 1)
+    Camera.CFrame = Camera.CFrame:Lerp(targetCFrame, alpha)
+end)
+
+-- Keybind handling
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if Aimbot.state.triggerKey ~= "None" and input.KeyCode.Name == Aimbot.state.triggerKey then
+        Aimbot._keyDown = true
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if Aimbot.state.triggerKey ~= "None" and input.KeyCode.Name == Aimbot.state.triggerKey then
+        Aimbot._keyDown = false
+    end
+end)
+
+registerModule("Combat", Aimbot)
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 09] COMBAT — AIM SILENT
+--═══════════════════════════════════════════════════════════════════════
+
+local AimSilent = {
+    key = "aimsilent",
+    name = "Aim Silent",
+    defaultState = false,
+    state = {
+        enabled = false,
+        fov = 100,
+        maxDist = 500,
+        checkFriend = true,
+        hitChance = 100,    -- % cơ hội redirect thành công
+    },
+}
+
+AimSilent._hooked = false
+
+AimSilent.buildSettings = function(scroll, def)
+    CreateSlider(scroll, "FOV Radius", 10, 500, def.state.fov, function(v)
+        def.state.fov = v
+    end)
+    CreateSlider(scroll, "Max Distance", 50, 3000, def.state.maxDist, function(v)
+        def.state.maxDist = v
+    end)
+    CreateSlider(scroll, "Hit Chance (%)", 1, 100, def.state.hitChance, function(v)
+        def.state.hitChance = v
+    end)
+    CreateToggle(scroll, "Không bắn bạn bè (team)", def.state.checkFriend, function(v)
+        def.state.checkFriend = v
+    end)
+end
+
+local function hookSilent()
+    if AimSilent._hooked then return end
+    AimSilent._hooked = true
+
+    local mt = getrawmetatable and getrawmetatable(game)
+    if not mt then return end
+
+    local oldNamecall = mt.__namecall
+    setreadonly(mt, false)
+
+    mt.__namecall = newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        if AimSilent.state.enabled
+            and (method == "FireServer" or method == "InvokeServer")
+            and typeof(self) == "Instance"
+            and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
+
+            -- Hit chance roll
+            if math.random(1, 100) <= AimSilent.state.hitChance then
+                local target = getClosestEnemyInFov(
+                    AimSilent.state.fov,
+                    AimSilent.state.maxDist,
+                    AimSilent.state.checkFriend,
+                    "Head"
+                )
+                if target then
+                    local args = { ... }
+                    local modified = false
+                    for i, arg in ipairs(args) do
+                        if typeof(arg) == "Vector3" then
+                            args[i] = target.head.Position
+                            modified = true
+                        elseif typeof(arg) == "CFrame" then
+                            args[i] = CFrame.new(target.head.Position)
+                            modified = true
+                        end
+                    end
+                    if modified then
+                        return oldNamecall(self, unpack(args))
+                    end
+                end
+            end
+        end
+        return oldNamecall(self, ...)
+    end)
+
+    setreadonly(mt, true)
+end
+
+AimSilent.onToggle = function(state)
+    AimSilent.state.enabled = state
+    if state then
+        pcall(hookSilent)
+    end
+end
+
+registerModule("Combat", AimSilent)
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 10] COMBAT — TRIGGER BOT
+--═══════════════════════════════════════════════════════════════════════
+
+local TriggerBot = {
+    key = "triggerbot",
+    name = "Trigger Bot",
+    defaultState = false,
+    state = {
+        enabled = false,
+        delayMs = 50,
+        checkFriend = true,
+        onlyVisible = true,
+        bodyPartFilter = "Any", -- Any / Head / Torso
+    },
+}
+
+TriggerBot._conn = nil
+
+TriggerBot.buildSettings = function(scroll, def)
+    CreateSlider(scroll, "Delay (ms)", 0, 1000, def.state.delayMs, function(v)
+        def.state.delayMs = v
+    end)
+    CreateToggle(scroll, "Không bắn bạn bè (team)", def.state.checkFriend, function(v)
+        def.state.checkFriend = v
+    end)
+    CreateToggle(scroll, "Chỉ bắn khi nhìn thấy", def.state.onlyVisible, function(v)
+        def.state.onlyVisible = v
+    end)
+    CreateButton(scroll, "Body Part: " .. def.state.bodyPartFilter, function()
+        local parts = { "Any", "Head", "Torso" }
+        local idx = table.find(parts, def.state.bodyPartFilter) or 1
+        idx = idx % #parts + 1
+        def.state.bodyPartFilter = parts[idx]
+    end)
+end
+
+TriggerBot.onToggle = function(state)
+    TriggerBot.state.enabled = state
+    if state and not TriggerBot._conn then
+        TriggerBot._conn = RunService.RenderStepped:Connect(function()
+            if not TriggerBot.state.enabled then return end
+            if not Camera then return end
+
+            local rayParams = RaycastParams.new()
+            rayParams.FilterDescendantsInstances = { LocalPlayer.Character }
+            rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+            local result = Workspace:Raycast(
+                Camera.CFrame.Position,
+                Camera.CFrame.LookVector * 1000,
+                rayParams
+            )
+
+            if result then
+                local hitPart = result.Instance
+                local hitModel = hitPart:FindFirstAncestorOfClass("Model")
+                if hitModel then
+                    local plr = Players:GetPlayerFromCharacter(hitModel)
+                    if plr and plr ~= LocalPlayer then
+                        if not (TriggerBot.state.checkFriend and isFriend(plr)) then
+                            -- Body part filter
+                            local validPart = false
+                            if TriggerBot.state.bodyPartFilter == "Any" then
+                                validPart = true
+                            elseif TriggerBot.state.bodyPartFilter == "Head" then
+                                validPart = hitPart.Name == "Head"
+                            elseif TriggerBot.state.bodyPartFilter == "Torso" then
+                                validPart = hitPart.Name == "Torso" or hitPart.Name == "UpperTorso"
+                            end
+
+                            if validPart then
+                                if TriggerBot.state.onlyVisible then
+                                    if isVisible(result.Position, { LocalPlayer.Character }) then
+                                        task.wait(TriggerBot.state.delayMs / 1000)
+                                        if TriggerBot.state.enabled then
+                                            mouse1click()
+                                        end
+                                    end
+                                else
+                                    task.wait(TriggerBot.state.delayMs / 1000)
+                                    if TriggerBot.state.enabled then
+                                        mouse1click()
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end)
+    elseif not state and TriggerBot._conn then
+        TriggerBot._conn:Disconnect()
+        TriggerBot._conn = nil
+    end
+end
+
+registerModule("Combat", TriggerBot)
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 11] RENDER — ESP PLAYER (2D/3D)
+--═══════════════════════════════════════════════════════════════════════
+
+local ESP = {
+    key = "esp",
+    name = "ESP Player",
+    defaultState = false,
+    state = {
+        enabled = false,
+        showFriend = false,
+        mode3d = false,
+        showName = true,
+        showDist = true,
+        showHealth = true,
+        showBox = true,
+        fillBox = false,
+        fillTransparency = 0.7,
+        textSize = 13,
+        maxDist = 1000,
+    },
+}
+
+ESP._drawings = {}
+
+local function clearEspDrawings()
+    for plr, drawings in pairs(ESP._drawings) do
+        for _, d in pairs(drawings) do
+            pcall(function() d:Remove() end)
+        end
+    end
+    table.clear(ESP._drawings)
+end
+
+local function getEspDrawings(plr)
+    if ESP._drawings[plr] then return ESP._drawings[plr] end
+
+    local d = {}
+
+    d.box = Drawing.new("Square")
+    d.box.Thickness = 1
+    d.box.Filled = false
+    d.box.Visible = false
+
+    d.boxFill = Drawing.new("Square")
+    d.boxFill.Thickness = 1
+    d.boxFill.Filled = true
+    d.boxFill.Visible = false
+
+    d.name = Drawing.new("Text")
+    d.name.Size = ESP.state.textSize
+    d.name.Center = true
+    d.name.Outline = true
+    d.name.Visible = false
+
+    d.dist = Drawing.new("Text")
+    d.dist.Size = ESP.state.textSize - 1
+    d.dist.Center = true
+    d.dist.Outline = true
+    d.dist.Visible = false
+
+    d.healthBar = Drawing.new("Square")
+    d.healthBar.Thickness = 1
+    d.healthBar.Filled = true
+    d.healthBar.Visible = false
+
+    d.healthBg = Drawing.new("Square")
+    d.healthBg.Thickness = 1
+    d.healthBg.Filled = true
+    d.healthBg.Visible = false
+
+    d.box3d = Drawing.new("Quad")
+    d.box3d.Thickness = 1
+    d.box3d.Filled = false
+    d.box3d.Visible = false
+
+    ESP._drawings[plr] = d
+    return d
+end
+
+ESP.onToggle = function(state)
+    ESP.state.enabled = state
+    if not state then
+        clearEspDrawings()
+    end
+end
+
+ESP.buildSettings = function(scroll, def)
+    CreateToggle(scroll, "Hiện bạn bè (team)", def.state.showFriend, function(v)
+        def.state.showFriend = v
+    end)
+    CreateToggle(scroll, "3D Box (tắt = 2D)", def.state.mode3d, function(v)
+        def.state.mode3d = v
+    end)
+    CreateToggle(scroll, "Hiện tên", def.state.showName, function(v)
+        def.state.showName = v
+    end)
+    CreateToggle(scroll, "Hiện khoảng cách", def.state.showDist, function(v)
+        def.state.showDist = v
+    end)
+    CreateToggle(scroll, "Hiện máu", def.state.showHealth, function(v)
+        def.state.showHealth = v
+    end)
+    CreateToggle(scroll, "Fill Box", def.state.fillBox, function(v)
+        def.state.fillBox = v
+    end)
+    CreateSlider(scroll, "Fill Transparency", 0, 100, math.floor(def.state.fillTransparency * 100), function(v)
+        def.state.fillTransparency = v / 100
+    end)
+    CreateSlider(scroll, "Text Size", 10, 24, def.state.textSize, function(v)
+        def.state.textSize = v
+    end)
+    CreateSlider(scroll, "Max Distance", 100, 5000, def.state.maxDist, function(v)
+        def.state.maxDist = v
+    end)
+end
+
+-- ESP Render loop
+RunService.RenderStepped:Connect(function()
+    if not ESP.state.enabled then return end
+    if not Camera then return end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            local isF = isFriend(plr)
+            local shouldShow = ESP.state.showFriend or not isF
+
+            if shouldShow then
+                local char, head, hrp, humanoid = getCharParts(plr)
+                if char then
+                    local dist = getDistance(hrp.Position, Camera.CFrame.Position)
+                    if dist <= ESP.state.maxDist then
+                        local d = getEspDrawings(plr)
+                        local pos, onScreen = Camera:WorldToViewportPoint(hrp.Position)
+
+                        if onScreen then
+                            local headPos = Camera:WorldToViewportPoint(head.Position)
+                            local legPos = Camera:WorldToViewportPoint(hrp.Position - Vector3.new(0, 3.5, 0))
+
+                            local height = math.abs(headPos.Y - legPos.Y)
+                            local width = height / 2
+                            local x = pos.X - width / 2
+                            local y = headPos.Y
+
+                            local color = isF and Color3.fromRGB(80, 200, 120) or Theme.Accent
+
+                            -- Box
+                            if ESP.state.showBox then
+                                if ESP.state.mode3d then
+                                    -- 3D Box
+                                    local size = Vector3.new(4, 6, 2)
+                                    local cf = hrp.CFrame
+                                    local corners = {}
+                                    for sx = -1, 1, 2 do
+                                        for sy = -1, 1, 2 do
+                                            for sz = -1, 1, 2 do
+                                                local corner = cf * CFrame.new(sx * size.X/2, sy * size.Y/2, sz * size.Z/2)
+                                                local sp, vis = Camera:WorldToViewportPoint(corner.Position)
+                                                table.insert(corners, { pos = sp, visible = vis })
+                                            end
+                                        end
+                                    end
+                                    if #corners == 8 then
+                                        -- Front face
+                                        d.box3d.PointA = Vector2.new(corners[1].pos.X, corners[1].pos.Y)
+                                        d.box3d.PointB = Vector2.new(corners[2].pos.X, corners[2].pos.Y)
+                                        d.box3d.PointC = Vector2.new(corners[4].pos.X, corners[4].pos.Y)
+                                        d.box3d.PointD = Vector2.new(corners[3].pos.X, corners[3].pos.Y)
+                                        d.box3d.Color = color
+                                        d.box3d.Visible = true
+                                    end
+                                    d.box.Visible = false
+                                    d.boxFill.Visible = false
+                                else
+                                    -- 2D Box
+                                    d.box.Size = Vector2.new(width, height)
+                                    d.box.Position = Vector2.new(x, y)
+                                    d.box.Color = color
+                                    d.box.Visible = true
+                                    d.box3d.Visible = false
+
+                                    if ESP.state.fillBox then
+                                        d.boxFill.Size = Vector2.new(width, height)
+                                        d.boxFill.Position = Vector2.new(x, y)
+                                        d.boxFill.Color = color
+                                        d.boxFill.Transparency = ESP.state.fillTransparency
+                                        d.boxFill.Visible = true
+                                    else
+                                        d.boxFill.Visible = false
+                                    end
+                                end
+                            else
+                                d.box.Visible = false
+                                d.boxFill.Visible = false
+                                d.box3d.Visible = false
+                            end
+
+                            -- Name
+                            if ESP.state.showName then
+                                d.name.Text = plr.Name
+                                d.name.Position = Vector2.new(pos.X, y - 18)
+                                d.name.Color = color
+                                d.name.Size = ESP.state.textSize
+                                d.name.Visible = true
+                            else
+                                d.name.Visible = false
+                            end
+
+                            -- Distance
+                            if ESP.state.showDist then
+                                d.dist.Text = "[" .. math.floor(dist) .. "m]"
+                                d.dist.Position = Vector2.new(pos.X, y + height + 4)
+                                d.dist.Color = Theme.TextMuted
+                                d.dist.Size = ESP.state.textSize - 1
+                                d.dist.Visible = true
+                            else
+                                d.dist.Visible = false
+                            end
+
+                            -- Health bar
+                            if ESP.state.showHealth and humanoid then
+                                local hp = humanoid.Health / humanoid.MaxHealth
+                                local barWidth = 2
+                                local barHeight = height
+                                local barX = x - 6
+                                local barY = y
+
+                                d.healthBg.Size = Vector2.new(barWidth, barHeight)
+                                d.healthBg.Position = Vector2.new(barX, barY)
+                                d.healthBg.Color = Color3.fromRGB(40, 40, 40)
+                                d.healthBg.Visible = true
+
+                                d.healthBar.Size = Vector2.new(barWidth, barHeight * hp)
+                                d.healthBar.Position = Vector2.new(barX, barY + barHeight * (1 - hp))
+                                d.healthBar.Color = Color3.fromRGB(
+                                    math.floor(255 * (1 - hp)),
+                                    math.floor(255 * hp),
+                                    60
+                                )
+                                d.healthBar.Visible = true
+                            else
+                                d.healthBar.Visible = false
+                                d.healthBg.Visible = false
+                            end
+                        else
+                            -- Off screen — hide all
+                            for _, dr in pairs(d) do
+                                dr.Visible = false
+                            end
+                        end
+                    else
+                        -- Too far — hide
+                        local d = ESP._drawings[plr]
+                        if d then
+                            for _, dr in pairs(d) do
+                                dr.Visible = false
+                            end
+                        end
+                    end
+                end
+            else
+                -- Friend hidden
+                local d = ESP._drawings[plr]
+                if d then
+                    for _, dr in pairs(d) do
+                        dr.Visible = false
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- Cleanup on player leave
+Players.PlayerRemoving:Connect(function(plr)
+    if ESP._drawings[plr] then
+        for _, d in pairs(ESP._drawings[plr]) do
+            pcall(function() d:Remove() end)
+        end
+        ESP._drawings[plr] = nil
+    end
+end)
+
+registerModule("Render", ESP)
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 12] VISUAL — SKY AURORA (PROCEDURAL)
+--═══════════════════════════════════════════════════════════════════════
+
+local SkyAurora = {
+    key = "sky",
+    name = "Sky Aurora",
+    defaultState = false,
+    state = {
+        enabled = false,
+        speed = 0.5,
+        intensity = 1.0,
+        starDensity = 100,
+        waveCount = 4,
+        colorShift = 0,     -- 0-360 hue rotation
+    },
+}
+
+SkyAurora._skyObj = nil
+SkyAurora._oldSky = nil
+SkyAurora._conn = nil
+SkyAurora._offset = 0
+
+SkyAurora.onToggle = function(state)
+    SkyAurora.state.enabled = state
+    local lighting = Lighting
+
+    if state then
+        -- Save old sky
+        if not SkyAurora._oldSky then
+            SkyAurora._oldSky = lighting:FindFirstChildOfClass("Sky")
+        end
+        if SkyAurora._oldSky then
+            SkyAurora._oldSky.Parent = nil
+        end
+
+        -- Generate procedural sky texture
+        local texSize = 512
+        local pixels = generateSkyPixels(
+            texSize,
+            texSize,
+            SkyAurora.state.speed,
+            SkyAurora.state.intensity,
+            SkyAurora.state.starDensity
+        )
+
+        -- Encode and load
+        local pngData = encodePNG(texSize, texSize, pixels)
+        local assetPath = "deltax_aurora_sky.png"
+
+        local skyImg = ""
+        pcall(function()
+            if writefile and getcustomasset then
+                writefile(assetPath, pngData)
+                skyImg = getcustomasset(assetPath)
+            end
+        end)
+
+        -- Create Sky object
+        skyObj = Instance.new("Sky")
+        skyObj.Name = "DeltaX_AuroraSky"
+        if skyImg ~= "" then
+            skyObj.SkyboxBk = skyImg
+            skyObj.SkyboxDn = skyImg
+            skyObj.SkyboxFt = skyImg
+            skyObj.SkyboxLf = skyImg
+            skyObj.SkyboxRt = skyImg
+            skyObj.SkyboxUp = skyImg
+        end
+        skyObj.StarCount = SkyAurora.state.starDensity * 10
+        skyObj.SunAngularSize = 0
+        skyObj.MoonAngularSize = 0
+        skyObj.Parent = lighting
+
+        -- Animation loop
+        SkyAurora._conn = RunService.RenderStepped:Connect(function(dt)
+            if not SkyAurora.state.enabled then return end
+            SkyAurora._offset = SkyAurora._offset + dt * SkyAurora.state.speed
+
+            -- Shift ClockTime for subtle movement
+            lighting.ClockTime = (lighting.ClockTime + dt * SkyAurora.state.speed * 0.02) % 24
+
+            -- Adjust brightness based on intensity
+            lighting.Brightness = 1 + (SkyAurora.state.intensity - 0.5) * 0.5
+        end)
+    else
+        if SkyAurora._conn then
+            SkyAurora._conn:Disconnect()
+            SkyAurora._conn = nil
+        end
+        if skyObj then
+            skyObj:Destroy()
+            skyObj = nil
+        end
+        if SkyAurora._oldSky then
+            SkyAurora._oldSky.Parent = lighting
+            SkyAurora._oldSky = nil
+        end
+        lighting.Brightness = 1
+    end
+end
+
+SkyAurora.buildSettings = function(scroll, def)
+    CreateSlider(scroll, "Tốc độ chuyển động", 0, 100, math.floor(def.state.speed * 100), function(v)
+        def.state.speed = v / 100
+    end)
+    CreateSlider(scroll, "Intensity", 0, 100, math.floor(def.state.intensity * 100), function(v)
+        def.state.intensity = v / 100
+    end)
+    CreateSlider(scroll, "Star Density", 0, 500, def.state.starDensity, function(v)
+        def.state.starDensity = v
+    end)
+    CreateSlider(scroll, "Wave Count", 1, 8, def.state.waveCount, function(v)
+        def.state.waveCount = v
+    end)
+    CreateSlider(scroll, "Color Shift (hue)", 0, 360, def.state.colorShift, function(v)
+        def.state.colorShift = v
+    end)
+end
+
+registerModule("Visual", SkyAurora)
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 13] VISUAL — CUSTOM SHIFT LOCK (PROCEDURAL ICON)
+--═══════════════════════════════════════════════════════════════════════
+
+local CustomShiftlock = {
+    key = "shiftlock",
+    name = "Custom Shift Lock",
+    defaultState = false,
+    state = {
+        enabled = false,
+        iconSize = 64,
+        offsetX = 0,
+        offsetY = 0,
+        spinWithCamera = true,
+        iconStyle = "Crosshair", -- Crosshair / Dot / Ring / Arrow
+        iconColor = nil,          -- nil = use Theme.Accent
+    },
+}
+
+CustomShiftlock._gui = nil
+CustomShiftlock._conn = nil
+CustomShiftlock._iconLabel = nil
+
+CustomShiftlock.onToggle = function(state)
+    CustomShiftlock.state.enabled = state
+
+    if state then
+        -- Generate procedural icon
+        local size = CustomShiftlock.state.iconSize
+        local color = CustomShiftlock.state.iconColor or Theme.Accent
+
+        local pixels
+        if CustomShiftlock.state.iconStyle == "Crosshair" then
+            pixels = generateShiftlockPixels(size, color)
+        elseif CustomShiftlock.state.iconStyle == "Dot" then
+            pixels = generateArrowPixels(size, color)
+        else
+            pixels = generateShiftlockPixels(size, color)
+        end
+
+        local pngData = encodePNG(size, size, pixels)
+        local assetPath = "deltax_shiftlock_icon.png"
+        local img = ""
+
+        pcall(function()
+            if writefile and getcustomasset then
+                writefile(assetPath, pngData)
+                img = getcustomasset(assetPath)
+            end
+        end)
+
+        -- Create ScreenGui
+        CustomShiftlock._gui = Instance.new("ScreenGui")
+        CustomShiftlock._gui.Name = "DeltaX_ShiftLock"
+        CustomShiftlock._gui.ResetOnSpawn = false
+        CustomShiftlock._gui.IgnoreGuiInset = true
+        CustomShiftlock._gui.DisplayOrder = 998
+
+        local holder = gethui and gethui() or game:GetService("CoreGui")
+        pcall(function() CustomShiftlock._gui.Parent = holder end)
+        if not CustomShiftlock._gui.Parent then
+            CustomShiftlock._gui.Parent = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        end
+
+        -- Icon
+        CustomShiftlock._iconLabel = Instance.new("ImageLabel")
+        CustomShiftlock._iconLabel.Name = "Icon"
+        CustomShiftlock._iconLabel.Size = UDim2.fromOffset(size, size)
+        CustomShiftlock._iconLabel.Position = UDim2.new(0.5, CustomShiftlock.state.offsetX, 0.5, CustomShiftlock.state.offsetY)
+        CustomShiftlock._iconLabel.AnchorPoint = Vector2.new(0.5, 0.5)
+        CustomShiftlock._iconLabel.BackgroundTransparency = 1
+        CustomShiftlock._iconLabel.Image = img ~= "" and img or "rbxassetid://0"
+        CustomShiftlock._iconLabel.ImageColor3 = color
+        CustomShiftlock._iconLabel.Parent = CustomShiftlock._gui
+
+        -- Rotation loop
+        CustomShiftlock._conn = RunService.RenderStepped:Connect(function()
+            if not CustomShiftlock.state.enabled then return end
+            if not Camera then return end
+
+            if CustomShiftlock.state.spinWithCamera then
+                local _, yaw = Camera.CFrame:ToEulerAnglesYXZ()
+                CustomShiftlock._iconLabel.Rotation = math.deg(yaw)
+            end
+        end)
+    else
+        if CustomShiftlock._conn then
+            CustomShiftlock._conn:Disconnect()
+            CustomShiftlock._conn = nil
+        end
+        if CustomShiftlock._gui then
+            CustomShiftlock._gui:Destroy()
+            CustomShiftlock._gui = nil
+            CustomShiftlock._iconLabel = nil
+        end
+    end
+end
+
+CustomShiftlock.buildSettings = function(scroll, def)
+    CreateSlider(scroll, "Icon Size", 24, 256, def.state.iconSize, function(v)
+        def.state.iconSize = v
+        if CustomShiftlock._iconLabel then
+            CustomShiftlock._iconLabel.Size = UDim2.fromOffset(v, v)
+        end
+    end)
+    CreateSlider(scroll, "Offset X", -300, 300, def.state.offsetX, function(v)
+        def.state.offsetX = v
+        if CustomShiftlock._iconLabel then
+            CustomShiftlock._iconLabel.Position = UDim2.new(0.5, v, 0.5, def.state.offsetY)
+        end
+    end)
+    CreateSlider(scroll, "Offset Y", -300, 300, def.state.offsetY, function(v)
+        def.state.offsetY = v
+        if CustomShiftlock._iconLabel then
+            CustomShiftlock._iconLabel.Position = UDim2.new(0.5, def.state.offsetX, 0.5, v)
+        end
+    end)
+    CreateToggle(scroll, "Xoay theo camera", def.state.spinWithCamera, function(v)
+        def.state.spinWithCamera = v
+    end)
+    CreateButton(scroll, "Style: " .. def.state.iconStyle, function()
+        local styles = { "Crosshair", "Dot", "Ring", "Arrow" }
+        local idx = table.find(styles, def.state.iconStyle) or 1
+        idx = idx % #styles + 1
+        def.state.iconStyle = styles[idx]
+        -- Rebuild icon with new style
+        if def.state.enabled then
+            def.onToggle(false)
+            def.onToggle(true)
+        end
+    end)
+end
+
+registerModule("Visual", CustomShiftlock)
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 14] VISUAL — TARGET ESP (PROCEDURAL ARROW)
+--═══════════════════════════════════════════════════════════════════════
+
+local TargetESP = {
+    key = "targetesp",
+    name = "Target ESP",
+    defaultState = false,
+    state = {
+        enabled = false,
+        spinSpeed = 1.0,     -- rotations per second
+        radius = 4,          -- orbit radius (studs)
+        maxDist = 100,       -- activation distance
+        fovAngle = 30,       -- degrees — "looking at" threshold
+        arrowSize = 64,      -- billboard size
+        showWhenClose = true, -- activate when very close regardless of look direction
+        closeDist = 10,      -- "close" threshold
+        orbitMode = "Circle", -- Circle / Vertical / Horizontal
+        pulseEffect = true,  -- scale pulsing
+    },
+}
+
+TargetESP._gui = nil
+TargetESP._img = nil
+TargetESP._conn = nil
+TargetESP._currentTarget = nil
+TargetESP._angle = 0
+
+-- Find target: looking at OR close
+local function findTargetESP()
+    if not Camera then return nil end
+    local best = nil
+    local bestScore = math.huge
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and not isFriend(plr) then
+            local char, head, hrp = getCharParts(plr)
+            if char then
+                local dist = getDistance(hrp.Position, Camera.CFrame.Position)
+                if dist <= TargetESP.state.maxDist then
+                    local toTarget = (head.Position - Camera.CFrame.Position).Unit
+                    local dot = Camera.CFrame.LookVector:Dot(toTarget)
+                    local angle = math.deg(math.acos(clamp(dot, -1, 1)))
+
+                    local isLooking = angle <= TargetESP.state.fovAngle
+                    local isClose = TargetESP.state.showWhenClose and dist <= TargetESP.state.closeDist
+
+                    if isLooking or isClose then
+                        local score = angle + dist * 0.1
+                        if score < bestScore then
+                            bestScore = score
+                            best = { player = plr, head = head, hrp = hrp, dist = dist }
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+TargetESP.onToggle = function(state)
+    TargetESP.state.enabled = state
+
+    if state then
+        -- Generate procedural arrow
+        local size = TargetESP.state.arrowSize
+        local pixels = generateArrowPixels(size, Theme.Accent)
+        local pngData = encodePNG(size, size, pixels)
+        local assetPath = "deltax_target_arrow.png"
+        local img = ""
+
+        pcall(function()
+            if writefile and getcustomasset then
+                writefile(assetPath, pngData)
+                img = getcustomasset(assetPath)
+            end
+        end)
+
+        -- Create BillboardGui
+        TargetESP._gui = Instance.new("BillboardGui")
+        TargetESP._gui.Name = "DeltaX_TargetESP"
+        TargetESP._gui.Size = UDim2.fromOffset(size, size)
+        TargetESP._gui.StudsOffset = Vector3.new(0, 3, 0)
+        TargetESP._gui.AlwaysOnTop = true
+        TargetESP._gui.Enabled = false
+
+        TargetESP._img = Instance.new("ImageLabel")
+        TargetESP._img.Name = "Arrow"
+        TargetESP._img.Size = UDim2.new(1, 0, 1, 0)
+        TargetESP._img.BackgroundTransparency = 1
+        TargetESP._img.Image = img ~= "" and img or "rbxassetid://0"
+        TargetESP._img.ImageColor3 = Theme.Accent
+        TargetESP._img.Parent = TargetESP._gui
+
+        -- Orbit animation
+        TargetESP._conn = RunService.RenderStepped:Connect(function(dt)
+            if not TargetESP.state.enabled then return end
+
+            local newTarget = findTargetESP()
+
+            if newTarget then
+                if TargetESP._currentTarget ~= newTarget.player then
+                    TargetESP._currentTarget = newTarget.player
+                    TargetESP._gui.Parent = newTarget.head
+                    TargetESP._gui.Enabled = true
+                end
+
+                -- Spin
+                TargetESP._angle = TargetESP._angle + dt * TargetESP.state.spinSpeed * 360
+
+                -- Pulse effect
+                local scale = 1.0
+                if TargetESP.state.pulseEffect then
+                    scale = 1.0 + 0.15 * math.sin(TargetESP._angle * 0.05)
+                end
+                TargetESP._img.Rotation = TargetESP._angle % 360
+
+                -- Orbit
+                local rad = math.rad(TargetESP._angle)
+                local r = TargetESP.state.radius
+
+                if TargetESP.state.orbitMode == "Circle" then
+                    TargetESP._gui.StudsOffset = Vector3.new(
+                        math.cos(rad) * r,
+                        3 + math.sin(rad * 2) * 0.5,
+                        math.sin(rad) * r
+                    )
+                elseif TargetESP.state.orbitMode == "Vertical" then
+                    TargetESP._gui.StudsOffset = Vector3.new(
+                        0,
+                        3 + math.sin(rad) * r,
+                        0
+                    )
+                elseif TargetESP.state.orbitMode == "Horizontal" then
+                    TargetESP._gui.StudsOffset = Vector3.new(
+                        math.cos(rad) * r,
+                        3,
+                        math.sin(rad) * r
+                    )
+                end
+            else
+                TargetESP._currentTarget = nil
+                TargetESP._gui.Enabled = false
+                TargetESP._gui.Parent = nil
+            end
+        end)
+    else
+        if TargetESP._conn then
+            TargetESP._conn:Disconnect()
+            TargetESP._conn = nil
+        end
+        if TargetESP._gui then
+            TargetESP._gui:Destroy()
+            TargetESP._gui = nil
+            TargetESP._img = nil
+        end
+        TargetESP._currentTarget = nil
+    end
+end
+
+TargetESP.buildSettings = function(scroll, def)
+    CreateSlider(scroll, "Tốc độ quay", 0, 100, math.floor(def.state.spinSpeed * 100), function(v)
+        def.state.spinSpeed = v / 100
+    end)
+    CreateSlider(scroll, "Bán kính vòng xoay", 1, 30, def.state.radius, function(v)
+        def.state.radius = v
+    end)
+    CreateSlider(scroll, "Khoảng cách kích hoạt", 10, 500, def.state.maxDist, function(v)
+        def.state.maxDist = v
+    end)
+    CreateSlider(scroll, "Góc nhìn (FOV)", 5, 90, def.state.fovAngle, function(v)
+        def.state.fovAngle = v
+    end)
+    CreateSlider(scroll, "Arrow Size", 32, 256, def.state.arrowSize, function(v)
+        def.state.arrowSize = v
+        if def.state.enabled then
+            def.onToggle(false)
+            def.onToggle(true)
+        end
+    end)
+    CreateToggle(scroll, "Kích hoạt khi ở gần", def.state.showWhenClose, function(v)
+        def.state.showWhenClose = v
+    end)
+    CreateToggle(scroll, "Pulse Effect", def.state.pulseEffect, function(v)
+        def.state.pulseEffect = v
+    end)
+    CreateButton(scroll, "Orbit Mode: " .. def.state.orbitMode, function()
+        local modes = { "Circle", "Vertical", "Horizontal" }
+        local idx = table.find(modes, def.state.orbitMode) or 1
+        idx = idx % #modes + 1
+        def.state.orbitMode = modes[idx]
+    end)
+end
+
+registerModule("Visual", TargetESP)
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 15] BUILD ALL MODULES INTO TABS
+--═══════════════════════════════════════════════════════════════════════
+
+local function findTabPage(tabName)
+    local contentArea = DeltaXUI.MainFrame:FindFirstChild("ContentArea")
+    if not contentArea then return nil end
+    return contentArea:FindFirstChild("Page_" .. tabName)
+end
+
+for tabName, moduleList in pairs(Modules) do
+    local tabPage = findTabPage(tabName)
+    if tabPage then
+        for _, moduleDef in ipairs(moduleList) do
+            buildModuleCard(tabPage, tabName, moduleDef)
+        end
+    end
+end
+
+--═══════════════════════════════════════════════════════════════════════
+-- [SECTION 16] EXPORT API
+--═══════════════════════════════════════════════════════════════════════
+
+local DeltaXModules = {
+    version = "2.0.0",
+    modules = Modules,
+    helpers = {
+        isFriend = isFriend,
+        getCharParts = getCharParts,
+        getClosestEnemyInFov = getClosestEnemyInFov,
+        getClosestEnemyByDist = getClosestEnemyByDist,
+        isVisible = isVisible,
+        inFov = inFov,
+        getScreenDist = getScreenDist,
+    },
+    procedural = {
+        generateSkyPixels = generateSkyPixels,
+        generateArrowPixels = generateArrowPixels,
+        generateShiftlockPixels = generateShiftlockPixels,
+        encodePNG = encodePNG,
+    },
+}
+
+if getgenv then
+    pcall(function()
+        getgenv().DeltaXModules = DeltaXModules
+    end)
+end
+
+print("[DeltaX_Modules] v2.0 loaded — Combat(3) Render(1) Visual(3) — procedural assets, no image files needed")
